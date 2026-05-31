@@ -1,0 +1,96 @@
+version: "3.9"
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  rag-net:
+    driver: bridge
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+volumes:
+  ollama-data:   # Ollama model weights (~4-10 GB)
+  app-data:      # SQLite DB + ChromaDB persistence
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+
+  # ── Ollama (local LLM inference) ───────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    networks:
+      - rag-net
+    volumes:
+      - ollama-data:/root/.ollama
+    ports:
+      - "11434:11434"          # Expose for optional host-side debugging
+    # GPU passthrough — comment out the 'deploy' block if you have no GPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── Model puller — runs once then exits ────────────────────────────────────
+  model-puller:
+    image: ollama/ollama:latest
+    container_name: model-puller
+    restart: "no"
+    networks:
+      - rag-net
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: >
+      sh -c "
+        echo 'Waiting for Ollama to be ready...' &&
+        until curl -sf http://ollama:11434/api/tags; do sleep 5; done &&
+        echo 'Pulling LLM model...' &&
+        ollama pull llama3.2 &&
+        echo 'Pulling embedding model...' &&
+        ollama pull nomic-embed-text &&
+        echo 'All models ready.'
+      "
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  # ── FastAPI RAG service ────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-api
+    restart: unless-stopped
+    networks:
+      - rag-net
+    volumes:
+      - app-data:/app/data
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - LLM_MODEL=llama3.2
+      - EMBEDDING_MODEL=nomic-embed-text
+      - DATABASE_URL=sqlite:///./data/production_data.db
+      - CHROMA_PERSIST_PATH=./data/chroma_db
+      - USER_CONTEXT_TOP_K=2
+      - GLOBAL_CONTEXT_TOP_K=3
+      - SENTENCES_PER_CHUNK=3
+      - CHUNK_OVERLAP=1
+    depends_on:
+      model-puller:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
